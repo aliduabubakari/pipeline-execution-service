@@ -1,0 +1,184 @@
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+    networks:
+      - app_network
+    restart: unless-stopped
+
+  package-seeder:
+    image: busybox
+    command: >
+      sh -c "
+      echo 'Seeding DAGs...' &&
+      cp /packages/sample_package/dags/*.py /mnt/dags/ &&
+      echo 'Seeding scripts...' &&
+      cp /packages/sample_package/scripts/*.py /mnt/scripts/ &&
+      echo 'Seeding input data...' &&
+      cp /packages/sample_package/data/*.csv /mnt/data/ &&
+      echo 'Done seeding.' &&
+      ls -la /mnt/dags /mnt/scripts /mnt/data
+      "
+    volumes:
+      - airflow_dags:/mnt/dags
+      - pipeline_scripts:/mnt/scripts
+      - pipeline_data:/mnt/data
+      - ../packages:/packages:ro
+    networks:
+      - app_network
+
+  airflow-init:
+    build:
+      context: ..
+      dockerfile: airflow/Dockerfile
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    volumes:
+      - airflow_dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - pipeline_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      package-seeder:
+        condition: service_completed_successfully
+    command: version
+    networks:
+      - app_network
+
+  airflow-webserver:
+    build:
+      context: ..
+      dockerfile: airflow/Dockerfile
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 15
+      AIRFLOW__METRICS__STATSD_ON: "true"
+      AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+      AIRFLOW__METRICS__STATSD_PORT: 8125
+      AIRFLOW__METRICS__STATSD_PREFIX: airflow
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - airflow_dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - pipeline_data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    command: webserver
+    group_add:
+      - "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      package-seeder:
+        condition: service_completed_successfully
+    networks:
+      - app_network
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build:
+      context: ..
+      dockerfile: airflow/Dockerfile
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 15
+      AIRFLOW__METRICS__STATSD_ON: "true"
+      AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+      AIRFLOW__METRICS__STATSD_PORT: 8125
+      AIRFLOW__METRICS__STATSD_PREFIX: airflow
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - airflow_dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - pipeline_data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: scheduler
+    group_add:
+      - "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      package-seeder:
+        condition: service_completed_successfully
+    networks:
+      - app_network
+    restart: unless-stopped
+
+  execution-api:
+    build:
+      context: ..
+      dockerfile: execution_api/Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      DAGS_DIR: /mnt/dags
+      SCRIPTS_DIR: /mnt/scripts
+      DATA_DIR: /mnt/data
+      AIRFLOW_URL: http://airflow-webserver:8080   # ← add
+      AIRFLOW_USER: airflow                        # ← add
+      AIRFLOW_PASSWORD: airflow                    # ← add
+    volumes:
+      - airflow_dags:/mnt/dags
+      - pipeline_scripts:/mnt/scripts
+      - pipeline_data:/mnt/data
+    networks:
+      - app_network
+
+  streamlit:
+    build:
+      context: ../streamlit_app
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      EXECUTION_API_URL: http://execution-api:8090
+      PROMETHEUS_URL: http://prometheus:9090
+    depends_on:
+      - execution-api
+    networks:
+      - app_network
+    restart: unless-stopped
+
+networks:
+  app_network:
+    name: app_network
+
+volumes:
+  airflow_postgres:
+    name: airflow_postgres
+  airflow_dags:
+    name: airflow_dags
+  airflow_logs:
+    name: airflow_logs
+  pipeline_scripts:
+    name: pipeline_scripts
+  pipeline_data:
+    name: pipeline_data
+  node_exporter_textfile:
+    name: node_exporter_textfile
+  prometheus_data:
+    name: prometheus_data
+  grafana_storage:
+    name: grafana_storage
