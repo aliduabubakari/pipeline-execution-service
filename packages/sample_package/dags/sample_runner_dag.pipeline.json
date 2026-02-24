@@ -1,0 +1,17 @@
+{
+  "dag_id": "sample_runner_dag",
+  "tasks": [
+    {
+      "id": "run_transform",
+      "script": "transform.py",
+      "env": {
+        "INPUT_FILE": "/app/data/input.csv",
+        "OUTPUT_FILE": "/app/data/output.csv"
+      }
+    }
+  ],
+  "tags": [
+    "mvp",
+    "runner"
+  ]
+}

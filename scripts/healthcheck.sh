@@ -3,7 +3,7 @@
 # Run after `docker compose up -d` to verify every service is healthy.
 # Usage:
 #   ./scripts/healthcheck.sh           # check once
-#   ./scripts/healthcheck.sh --wait    # poll until all healthy (max 3 min)
+#   ./scripts/healthcheck.sh --wait    # poll until all healthy (default max 6 min)
 #
 # Exit codes:
 #   0 = all services healthy
@@ -13,6 +13,22 @@ set -euo pipefail
 
 WAIT_MODE=false
 [[ "${1:-}" == "--wait" ]] && WAIT_MODE=true
+
+resolve_streamlit_host_port() {
+  if [[ -n "${STREAMLIT_HOST_PORT:-}" ]]; then
+    echo "$STREAMLIT_HOST_PORT"
+    return 0
+  fi
+  local port_out
+  port_out=$(docker compose port streamlit 8501 2>/dev/null | tail -n1 || true)
+  if [[ "$port_out" =~ :([0-9]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "8501"
+  fi
+}
+
+STREAMLIT_PORT="$(resolve_streamlit_host_port)"
 
 # ── colours ──────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -31,7 +47,7 @@ SERVICES=(
   "Airflow Webserver  |http  |http://localhost:8080/health"
   "Airflow Scheduler  |docker|airflow-scheduler"
   "Execution API      |http  |http://localhost:8090/docs"
-  "Streamlit UI       |http  |http://localhost:8501/_stcore/health"
+  "Streamlit UI       |http  |http://localhost:${STREAMLIT_PORT}/_stcore/health"
   "Prometheus         |http  |http://localhost:9090/-/ready"
   "Grafana            |http  |http://localhost:3000/api/health"
   "node-exporter      |http  |http://localhost:9100/metrics"
@@ -62,7 +78,7 @@ for line in sys.stdin:
         print(obj.get('Health', obj.get('State', 'unknown')))
         break
 " 2>/dev/null || echo "unknown")
-  [[ "$status" == "healthy" || "$status" == "running" ]]
+  [[ "$status" == "healthy" || "$status" == "running" || "$status" == "Up" ]]
 }
 
 run_check() {
@@ -124,7 +140,7 @@ run_all_checks() {
     echo -e "  ${GREEN}${BOLD}All services healthy.${RESET}"
     echo ""
     echo -e "  ${CYAN}Access points:${RESET}"
-    echo -e "  ${DIM}Streamlit UI    →${RESET}  http://localhost:8501"
+    echo -e "  ${DIM}Streamlit UI    →${RESET}  http://localhost:${STREAMLIT_PORT}"
     echo -e "  ${DIM}Airflow         →${RESET}  http://localhost:8080  ${DIM}(airflow / airflow)${RESET}"
     echo -e "  ${DIM}Execution API   →${RESET}  http://localhost:8090/docs"
     echo -e "  ${DIM}Prometheus      →${RESET}  http://localhost:9090"
@@ -141,8 +157,8 @@ run_all_checks() {
 
 # ── wait mode: poll until all healthy or timeout ──────────────────────────────
 if $WAIT_MODE; then
-  MAX_WAIT=180
-  INTERVAL=5
+  MAX_WAIT="${PES_HEALTHCHECK_MAX_WAIT:-360}"
+  INTERVAL="${PES_HEALTHCHECK_INTERVAL:-5}"
   elapsed=0
 
   echo ""

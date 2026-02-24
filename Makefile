@@ -38,7 +38,7 @@ health:   ## Run health check against running stack
 	@bash scripts/healthcheck.sh
 
 .PHONY: health-wait
-health-wait:   ## Poll until all services healthy (max 3 min)
+health-wait:   ## Poll until all services healthy (default max 6 min)
 	@bash scripts/healthcheck.sh --wait
 
 # ── Runner image ──────────────────────────────────────────────────────────────
@@ -98,7 +98,7 @@ check-dag:   ## Check DAG is registered and has no import errors
 demo: up upload   ## Full demo: start stack + upload package (ready to use from Streamlit)
 	@echo ""
 	@echo "⬡  Demo stack ready."
-	@echo "   Open Streamlit  →  http://localhost:8501"
+	@echo "   Open Streamlit  →  http://localhost:8502"
 	@echo "   Open Airflow    →  http://localhost:8080"
 	@echo "   Open Grafana    →  http://localhost:3000"
 	@echo ""

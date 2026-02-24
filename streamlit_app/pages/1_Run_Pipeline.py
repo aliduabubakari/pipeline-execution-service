@@ -9,7 +9,6 @@ import time
 import pandas as pd
 import streamlit as st
 
-# shared style is applied in Home.py; re-apply page config here for direct navigation
 st.set_page_config(
     page_title="Run Pipeline · PES",
     page_icon="⬡",
@@ -17,7 +16,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# inject styles (needed when landing directly on this page)
 st.markdown(
     """
     <style>
@@ -50,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from utils import api, cfg
 
 
-# ── helpers ─────────────────────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────────
 def badge(state: str) -> str:
     cls = {
         "success": "badge-success",
@@ -78,24 +76,29 @@ def step_header(n: str, title: str, done: bool = False) -> None:
     )
 
 
-# ── state ────────────────────────────────────────────────────────────────────
-if "upload_done"  not in st.session_state: st.session_state.upload_done  = False
-if "installed"    not in st.session_state: st.session_state.installed    = {}
-if "run_id"       not in st.session_state: st.session_state.run_id       = None
-if "dag_id"       not in st.session_state: st.session_state.dag_id       = None
-if "run_state"    not in st.session_state: st.session_state.run_state    = None
-if "output_csv"   not in st.session_state: st.session_state.output_csv   = None
+# ── session state defaults ────────────────────────────────────────────────────
+for key, default in [
+    ("upload_done",     False),
+    ("installed",       {}),
+    ("discovered_dags", []),
+    ("run_id",          None),
+    ("dag_id",          None),
+    ("run_state",       None),
+    ("output_csv",      None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
-# ── page header ──────────────────────────────────────────────────────────────
+# ── page header ───────────────────────────────────────────────────────────────
 st.markdown("# Run Pipeline")
 st.markdown("## Upload · Select · Execute · Inspect")
 st.divider()
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — UPLOAD
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 step_header("01", "Upload package", st.session_state.upload_done)
 
 uploaded = st.file_uploader(
@@ -109,14 +112,15 @@ with col_up1:
     upload_btn = st.button("⬆  Upload Package", disabled=(uploaded is None))
 
 if upload_btn and uploaded:
-    with st.spinner("Uploading and installing…"):
+    with st.spinner("Uploading — waiting for Airflow to register DAGs (up to 60 s)…"):
         try:
             result = api.upload(uploaded.read(), uploaded.name)
-            st.session_state.installed   = result.get("installed", {})
-            st.session_state.upload_done = True
-            st.session_state.run_id      = None
-            st.session_state.run_state   = None
-            st.session_state.output_csv  = None
+            st.session_state.installed       = result.get("installed", {})
+            st.session_state.discovered_dags = result.get("discovered_dags", [])
+            st.session_state.upload_done     = True
+            st.session_state.run_id          = None
+            st.session_state.run_state       = None
+            st.session_state.output_csv      = None
         except Exception as e:
             st.error(f"Upload failed: {e}")
 
@@ -139,20 +143,21 @@ if st.session_state.upload_done and st.session_state.installed:
             )
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — SELECT & TRIGGER
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 st.divider()
 step_header("02", "Select DAG and trigger run", bool(st.session_state.run_id))
 
-pipelines = []
-if st.session_state.upload_done:
+# Use DAGs confirmed by Airflow at upload time.
+# Fall back to a live query if the user navigated here directly (no upload this session).
+dag_options = st.session_state.discovered_dags
+if not dag_options:
     try:
-        pipelines = api.list_pipelines()
+        dag_options = [p["dag_id"] for p in api.list_pipelines()]
     except Exception as e:
         st.warning(f"Could not reach Airflow: {e}")
-
-dag_options = [p["dag_id"] for p in pipelines]
+        dag_options = []
 
 col_sel, col_btn = st.columns([3, 2])
 with col_sel:
@@ -172,17 +177,17 @@ if trigger_btn and selected_dag and selected_dag != "— no DAGs found —":
     with st.spinner("Triggering…"):
         try:
             run = api.trigger(selected_dag)
-            st.session_state.run_id    = run["run_id"]
-            st.session_state.dag_id    = run["dag_id"]
-            st.session_state.run_state = run["state"]
+            st.session_state.run_id     = run["run_id"]
+            st.session_state.dag_id     = run["dag_id"]
+            st.session_state.run_state  = run["state"]
             st.session_state.output_csv = None
         except Exception as e:
             st.error(f"Trigger failed: {e}")
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — STATUS POLLING
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.run_id:
     st.divider()
     step_header("03", "Run status", st.session_state.run_state == "success")
@@ -222,16 +227,12 @@ if st.session_state.run_id:
         )
 
     # initial render
-    render_status(
-        st.session_state.run_state,
-        st.session_state.run_id,
-        None, None,
-    )
+    render_status(st.session_state.run_state, st.session_state.run_id, None, None)
 
     # live poll loop
     if st.session_state.run_state in ("queued", "running"):
         progress_slot.info("⏳  Pipeline is running — polling every 3 s…")
-        for _ in range(120):   # max 6 minutes of polling
+        for _ in range(120):   # max 6 minutes
             time.sleep(cfg.poll_interval)
             try:
                 status = api.run_status(st.session_state.dag_id, st.session_state.run_id)
@@ -255,9 +256,9 @@ if st.session_state.run_id:
             progress_slot.error("✗  Pipeline run failed. Check Airflow logs.")
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — OUTPUT CSV
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.run_state == "success":
     st.divider()
     step_header("04", "Output data", bool(st.session_state.output_csv))
@@ -289,14 +290,16 @@ if st.session_state.run_state == "success":
                 mime="text/csv",
             )
 
-        # preview with row slider
-        n_preview = st.slider(
-            "Preview rows",
-            min_value=5,
-            max_value=min(total_rows, 100),
-            value=min(10, total_rows),
-            step=5,
-        )
+        if total_rows > 1:
+            n_preview = st.slider(
+                "Preview rows",
+                min_value=1,
+                max_value=min(total_rows, 100),
+                value=min(10, total_rows),
+                step=1,
+            )
+        else:
+            n_preview = total_rows
         st.dataframe(
             df.head(n_preview),
             use_container_width=True,
@@ -310,8 +313,8 @@ if st.session_state.run_state == "success":
                         padding:20px 24px;font-family:'IBM Plex Mono',monospace;font-size:0.8rem;color:#64748b;">
               output.csv not available via API.<br>
               <span style="color:#475569;font-size:0.73rem;">
-                Add a <code>GET /files/output.csv</code> endpoint to execution_api, or mount
-                the <code>pipeline_data</code> volume directly into the Streamlit container.
+                Check that your pipeline script writes to <code>/app/data/output.csv</code>
+                and that the <code>pipeline_data</code> volume is mounted in the execution-api container.
               </span>
             </div>
             """,

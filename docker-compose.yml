@@ -1,0 +1,3 @@
+include:
+  - compose/docker-compose.core.yml
+  - compose/docker-compose.monitoring.yml

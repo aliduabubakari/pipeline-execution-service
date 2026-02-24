@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from execution_api.services.pipeline_spec import load_pipeline_specs, render_airflow_dag
 from execution_api.utils.fs import (
     PackageError,
     chmod_recursive_readable,
@@ -16,11 +17,21 @@ from execution_api.utils.fs import (
 
 
 EXPECTED_TOP_LEVEL = {"dags", "scripts", "data"}
+PIPELINE_MANIFEST_FILENAMES = (
+    "pipeline.json",
+    "pipeline-spec.json",
+    "pipeline.yaml",
+    "pipeline.yml",
+    "pipeline-spec.yaml",
+    "pipeline-spec.yml",
+)
 
 
 @dataclass
 class InstallResult:
     installed: dict[str, list[str]]  # folder -> list of top-level entries copied
+    generated_dags: list[str]
+    package_mode: str
 
 
 class PackageManager:
@@ -55,7 +66,7 @@ class PackageManager:
                 clear_dir(self.scripts_dir)
                 clear_dir(self.data_dir)
 
-            installed = {"dags": [], "scripts": [], "data": []}
+            installed = {"dags": [], "scripts": [], "data": [], "manifests": []}
 
             dags_src = extracted / "dags"
             if dags_src.exists():
@@ -72,19 +83,42 @@ class PackageManager:
                 installed["data"] = self._top_entries(data_src)
                 copy_tree(data_src, self.data_dir)
 
+            manifest_files = self._find_manifest_files(extracted)
+            generated_dags: list[str] = []
+            for manifest in manifest_files:
+                installed["manifests"].append(str(manifest.relative_to(extracted)))
+                for spec in load_pipeline_specs(manifest):
+                    dag_filename = f"{spec.dag_id}.generated.py"
+                    dag_path = self.dags_dir / dag_filename
+                    dag_path.write_text(render_airflow_dag(spec), encoding="utf-8")
+                    generated_dags.append(spec.dag_id)
+                    if dag_filename not in installed["dags"]:
+                        installed["dags"].append(dag_filename)
+
+            installed["dags"] = sorted(installed["dags"])
+            installed["manifests"] = sorted(installed["manifests"])
+
             # permissions for Airflow + task-runner containers
             chmod_recursive_readable(self.dags_dir)
             chmod_recursive_readable(self.scripts_dir)
             chmod_recursive_readable(self.data_dir)
 
-            return InstallResult(installed=installed)
+            package_mode = "generated" if generated_dags and not dags_src.exists() else "mixed" if generated_dags else "legacy"
+            return InstallResult(
+                installed=installed,
+                generated_dags=sorted(generated_dags),
+                package_mode=package_mode,
+            )
 
     def _validate(self, extracted_dir: Path) -> None:
-        # allow extra files like README/manifest, but require at least one expected folder
+        # allow extra files like README/manifest, but require a recognized pipeline payload
         present = {p.name for p in extracted_dir.iterdir() if p.is_dir()}
-        if not (present & EXPECTED_TOP_LEVEL):
+        has_manifest = bool(self._find_manifest_files(extracted_dir))
+        if not (present & EXPECTED_TOP_LEVEL) and not has_manifest:
             raise PackageError(
-                f"Zip must contain at least one of {sorted(EXPECTED_TOP_LEVEL)} at top-level. Found: {sorted(present)}"
+                "Zip must contain at least one of "
+                f"{sorted(EXPECTED_TOP_LEVEL)} at top-level or a supported pipeline manifest "
+                f"({list(PIPELINE_MANIFEST_FILENAMES)} / pipelines/*.json). Found dirs: {sorted(present)}"
             )
 
         # if user includes these folders, they must be directories
@@ -95,3 +129,21 @@ class PackageManager:
 
     def _top_entries(self, p: Path) -> list[str]:
         return sorted([x.name for x in p.iterdir()])
+
+    def _find_manifest_files(self, extracted_dir: Path) -> list[Path]:
+        manifests: list[Path] = []
+        for filename in PIPELINE_MANIFEST_FILENAMES:
+            p = extracted_dir / filename
+            if p.exists():
+                if not p.is_file():
+                    raise PackageError(f"'{filename}' must be a file in the zip")
+                manifests.append(p)
+
+        pipelines_dir = extracted_dir / "pipelines"
+        if pipelines_dir.exists():
+            if not pipelines_dir.is_dir():
+                raise PackageError("'pipelines' must be a directory in the zip")
+            for pattern in ("*.json", "*.yaml", "*.yml"):
+                manifests.extend(sorted(pipelines_dir.glob(pattern)))
+
+        return sorted(set(manifests), key=lambda p: str(p))

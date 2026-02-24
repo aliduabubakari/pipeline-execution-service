@@ -75,6 +75,9 @@ services:
       AIRFLOW__METRICS__STATSD_PORT: 8125
       AIRFLOW__METRICS__STATSD_PREFIX: airflow
       DOCKER_HOST: unix:///var/run/docker.sock
+      # ↓ fix 401 on REST API
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "change_me_in_production"
     volumes:
       - airflow_dags:/opt/airflow/dags
       - airflow_logs:/opt/airflow/logs
@@ -151,7 +154,7 @@ services:
       context: ../streamlit_app
       dockerfile: Dockerfile
     ports:
-      - "8501:8501"
+      - "8502:8501"
     environment:
       EXECUTION_API_URL: http://execution-api:8090
       PROMETHEUS_URL: http://prometheus:9090

@@ -77,12 +77,11 @@ services:
 
 networks:
   app_network:
-    external: true
-    name: app_network    # ← must match exactly what core stack creates
+    name: app_network
 
 volumes:
   node_exporter_textfile:
-    external: true        # owned by the core stack, referenced here
+    name: node_exporter_textfile      # owned by the core stack, referenced here
   prometheus_data:
     name: prometheus_data
   grafana_storage:

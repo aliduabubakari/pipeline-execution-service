@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import requests
 
 
@@ -51,3 +52,27 @@ class AirflowClient:
         )
         r.raise_for_status()
         return r.json()
+
+    def wait_for_dag(
+        self,
+        dag_id: str,
+        timeout_s: int = 60,
+        poll_interval_s: int = 3,
+    ) -> bool:
+        """
+        Poll until the given dag_id appears in Airflow's registered DAGs.
+        Returns True if found within timeout, False otherwise.
+
+        Airflow rescans DAG_DIR every DAG_DIR_LIST_INTERVAL seconds (set to 15s).
+        This gives it up to `timeout_s` seconds to pick up a freshly copied file.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                dags = self.list_dags()
+                if any(d["dag_id"] == dag_id for d in dags):
+                    return True
+            except Exception:
+                pass  # Airflow might be briefly unavailable — keep retrying
+            time.sleep(poll_interval_s)
+        return False
