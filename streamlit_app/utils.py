@@ -34,6 +34,53 @@ class APIClient:
         r.raise_for_status()
         return r.json()
 
+    def metrics_capabilities(self) -> dict:
+        r = requests.get(f"{self.base}/metrics/capabilities", timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def task_metrics_latest(self, dag_id: str | None = None) -> dict:
+        params = {"dag_id": dag_id} if dag_id else None
+        r = requests.get(f"{self.base}/metrics/tasks/latest", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def task_metrics_latest_with_airflow(self, dag_id: str) -> dict:
+        r = requests.get(
+            f"{self.base}/metrics/tasks/latest-with-airflow",
+            params={"dag_id": dag_id},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def task_metrics_range(
+        self,
+        *,
+        dag_id: str | None = None,
+        task_id: str | None = None,
+        metric_name: str | None = None,
+        window: str = "1h",
+        step: str = "30s",
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict:
+        params = {"window": window, "step": step}
+        if dag_id:
+            params["dag_id"] = dag_id
+        if task_id:
+            params["task_id"] = task_id
+        if metric_name:
+            params["metric_name"] = metric_name
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+
+        r = requests.get(f"{self.base}/metrics/tasks/range", params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
     def list_pipelines(self) -> list[dict]:
         r = requests.get(f"{self.base}/pipelines", timeout=10)
         r.raise_for_status()

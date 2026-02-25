@@ -68,6 +68,24 @@ upload:   ## Zip and upload the sample package
 		"http://localhost:8090/upload?replace=true" | python3 -m json.tool
 	@echo "✓  Package uploaded"
 
+.PHONY: upload-generated
+upload-generated:   ## Zip and upload the declarative sample package (pipeline.yaml)
+	@echo "⬡  Packaging and uploading declarative sample..."
+	@rm -f packages/sample_generated_package.zip
+	@(cd packages/sample_generated_package && zip -r ../sample_generated_package.zip . -x "*.DS_Store")
+	@curl -sS -F "file=@packages/sample_generated_package.zip" \
+		"http://localhost:8090/upload?replace=true" | python3 -m json.tool
+	@echo "✓  Declarative package uploaded"
+
+.PHONY: upload-practical-generated
+upload-practical-generated:   ## Zip and upload the practical 3-task declarative demo package
+	@echo "⬡  Packaging and uploading practical declarative demo..."
+	@rm -f packages/practical_generated_package.zip
+	@(cd packages/practical_generated_package && zip -r ../practical_generated_package.zip . -x "*.DS_Store")
+	@curl -sS -F "file=@packages/practical_generated_package.zip" \
+		"http://localhost:8090/upload?replace=true" | python3 -m json.tool
+	@echo "✓  Practical declarative package uploaded"
+
 # ── Logs ─────────────────────────────────────────────────────────────────────
 
 .PHONY: logs

@@ -218,12 +218,6 @@ def _render_docker_task_block(dag_id: str, task: TaskSpec) -> str:
         + _docker_safe_name(task.task_id)
         + "_{{ ts_nodash }}_{{ ti.try_number }}"
     )
-    labels = {
-        "pes_dag_id": dag_id,
-        "pes_task_id": task.task_id,
-        "pes_metrics_enabled": str(task.metrics_enabled).lower(),
-        "pes_carbon_enabled": str(task.carbon_enabled).lower(),
-    }
     return f'''    task_map[{task.task_id!r}] = DockerOperator(
         task_id={task.task_id!r},
         image={task.image!r},
@@ -234,7 +228,6 @@ def _render_docker_task_block(dag_id: str, task: TaskSpec) -> str:
         mount_tmp_dir=False,
         tty=True,
         environment={env!r},
-        labels={labels!r},
         mounts=[
             {mounts_src},
         ],

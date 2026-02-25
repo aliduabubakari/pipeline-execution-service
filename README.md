@@ -29,7 +29,7 @@ Pipeline Execution Service (PES) lets you package a data transformation script, 
 
 **The intended workflow:**
 
-1. Drop a `.zip` package (DAG + script + data) onto the Streamlit UI
+1. Upload a `.zip` package (legacy or declarative) or build one from individual files in the Streamlit UI
 2. Select the DAG and click **Run Pipeline**
 3. Watch the status update in real time (queued → running → success)
 4. Preview and download the output CSV
@@ -49,7 +49,7 @@ Pipeline Execution Service (PES) lets you package a data transformation script, 
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        User / Browser                               │
 └───────────────────────────┬─────────────────────────────────────────┘
-                            │ http://localhost:8501
+                            │ http://localhost:8502
                             ▼
                    ┌─────────────────┐
                    │  Streamlit UI   │  (upload · trigger · poll · metrics)
@@ -129,7 +129,7 @@ node-exporter (healthy)
 | Docker Desktop | 4.x | Enable Docker socket access |
 | Docker Compose | v2 (`docker compose`) | Included with Docker Desktop |
 | Make | any | Pre-installed on macOS/Linux |
-| Free ports | — | 3000, 8080, 8081, 8090, 8501, 9090, 9100, 9102 |
+| Free ports | — | 3000, 8080, 8081, 8090, 8502, 9090, 9100, 9102 |
 | Disk space | ~4 GB | Images + volumes |
 
 > **macOS note:** Docker Desktop must have access to `/var/run/docker.sock`. Check in Settings → General → "Allow the default Docker socket to be used".
@@ -155,7 +155,7 @@ This single command:
 - Builds the `pipeline-task-runner:latest` image
 - Builds all service images (Airflow, execution-api, Streamlit)
 - Starts all 10 services via Docker Compose
-- Waits up to 3 minutes for every service to report healthy
+- Waits up to 6 minutes (default) for every service to report healthy
 - Prints a health summary and access links
 
 Expected final output:
@@ -165,7 +165,7 @@ Expected final output:
   ✓  Airflow Webserver       healthy    http://localhost:8080/health
   ✓  Airflow Scheduler       healthy
   ✓  Execution API           healthy    http://localhost:8090/docs
-  ✓  Streamlit UI            healthy    http://localhost:8501/_stcore/health
+  ✓  Streamlit UI            healthy    http://localhost:8502/_stcore/health
   ✓  Prometheus              healthy    http://localhost:9090/-/ready
   ✓  Grafana                 healthy    http://localhost:3000/api/health
   ✓  node-exporter           healthy    http://localhost:9100/metrics
@@ -174,7 +174,7 @@ Expected final output:
 
   All services healthy.
 
-  Streamlit UI  →  http://localhost:8501
+  Streamlit UI  →  http://localhost:8502
   Airflow       →  http://localhost:8080  (airflow / airflow)
   Grafana       →  http://localhost:3000  (admin / admin)
 ```
@@ -185,7 +185,7 @@ Expected final output:
 make upload     # zips and uploads packages/sample_package
 ```
 
-Then open **http://localhost:8501**, select `sample_runner_dag`, and click **Run Pipeline**.
+Then open **http://localhost:8502**, select `sample_runner_dag`, and click **Run Pipeline**.
 
 ### 4. Stop everything
 
@@ -268,7 +268,7 @@ pipeline-execution-service/
 
 | Service | Port | Credentials | Purpose |
 |---|---|---|---|
-| **Streamlit UI** | 8501 | — | Main user interface |
+| **Streamlit UI** | 8502 (host) → 8501 (container) | — | Main user interface |
 | **Execution API** | 8090 | — | REST API + Swagger UI at `/docs` |
 | **Airflow Webserver** | 8080 | `airflow` / `airflow` | DAG management, run history, task logs |
 | **Airflow Scheduler** | — | — | Executes DAG runs |
@@ -296,16 +296,33 @@ pipeline-execution-service/
 
 ## The Package Format
 
-A pipeline package is a `.zip` file with the following layout:
+PES supports two package styles:
 
-```
+1. **Legacy DAG package** (user supplies `dags/*.py`)
+2. **Declarative package** (user supplies `pipeline.yaml` / `pipeline.json`; PES generates the Airflow DAG)
+
+### Legacy DAG package
+
+```text
 my_package.zip
 ├── dags/
-│   └── my_dag.py           # Airflow DAG definition(s)
+│   └── my_dag.py
 ├── scripts/
-│   └── my_transform.py     # Python script executed by the runner
+│   └── my_transform.py
 └── data/
-    └── input.csv           # Input data
+    └── input.csv
+```
+
+### Declarative package (recommended)
+
+```text
+my_package.zip
+├── pipeline.yaml           # or pipeline.json
+├── scripts/
+│   ├── task_a.py
+│   └── task_b.py
+└── data/
+    └── input.csv
 ```
 
 When uploaded via `/upload` (or the Streamlit UI), each folder is extracted to the corresponding Docker volume:
@@ -315,6 +332,48 @@ When uploaded via `/upload` (or the Streamlit UI), each folder is extracted to t
 | `dags/` | → | `airflow_dags` | → | `/opt/airflow/dags` |
 | `scripts/` | → | `pipeline_scripts` | → | `/app/scripts` |
 | `data/` | → | `pipeline_data` | → | `/app/data` |
+
+If a declarative manifest is uploaded, the Execution API generates an instrumented Airflow DAG file (for example `my_dag.generated.py`) into `airflow_dags`.
+
+### `pipeline.json` (and `pipeline.yaml`) and Why It Matters
+
+`pipeline.json` / `pipeline.yaml` is the declarative contract between users and PES. It lets users describe tasks, scripts, and dependencies without writing Airflow code or embedding metrics instrumentation.
+
+Why it is important:
+
+- PES can **auto-generate `DockerOperator` DAGs** with the correct mounts, network, and metrics env vars
+- users do **not** need to modify task scripts for duration/exit/emissions collection
+- the system can validate package structure early and give clearer upload errors
+- Streamlit can auto-build a package from individual uploaded files by generating a simple `pipeline.json`
+
+Minimal example (`pipeline.json`):
+
+```json
+{
+  "dag_id": "my_pipeline",
+  "tasks": [
+    { "id": "extract", "script": "extract.py" },
+    { "id": "transform", "script": "transform.py", "depends_on": ["extract"] }
+  ]
+}
+```
+
+Equivalent `pipeline.yaml`:
+
+```yaml
+dag_id: my_pipeline
+tasks:
+  - id: extract
+    script: extract.py
+  - id: transform
+    script: transform.py
+    depends_on: [extract]
+```
+
+Notes:
+
+- `pipeline.yaml` is optional in the Streamlit UI. If the user uploads scripts but no manifest/DAG, Streamlit can generate a simple linear `pipeline.json`.
+- Generated pipelines currently target **`DockerOperator`** for task-level container metrics.
 
 ### Writing a DAG for PES
 
@@ -459,6 +518,12 @@ Configured in `monitoring/prometheus.yml`:
 | `statsd-exporter` | `statsd-exporter:9102` | Airflow internal metrics (`airflow_*`) |
 | `prometheus` | `prometheus:9090` | Prometheus self-metrics |
 
+### Storage and Querying Guidance
+
+- **Prometheus** is the primary store for task metrics (`pipeline_task_*`) and time-series queries.
+- **Airflow Postgres** is the source of orchestration metadata (DAG runs, task instance states/timestamps), not a replacement for Prometheus.
+- The **Execution API** now provides normalized metrics endpoints so the frontend does not need to build PromQL or merge Airflow metadata itself.
+
 ### Useful PromQL queries
 
 ```promql
@@ -498,14 +563,18 @@ curl -F "file=@packages/sample_package.zip" \
      "http://localhost:8090/upload?replace=true"
 ```
 
-**Response:**
+**Response (example for declarative upload):**
 ```json
 {
   "installed": {
-    "dags":    ["sample_runner_dag.py"],
+    "dags":    ["practical_orders_etl.generated.py"],
     "scripts": ["transform.py"],
-    "data":    ["input.csv"]
-  }
+    "data":    ["input.csv"],
+    "manifests": ["pipeline.yaml"]
+  },
+  "discovered_dags": ["practical_orders_etl"],
+  "generated_dags": ["practical_orders_etl"],
+  "package_mode": "generated"
 }
 ```
 
@@ -585,16 +654,61 @@ curl http://localhost:8090/files/output.csv -o output.csv
 
 ---
 
+### `GET /metrics/capabilities`
+
+Frontend capability discovery endpoint (provider reachability + supported metrics/endpoints).
+
+```bash
+curl http://localhost:8090/metrics/capabilities
+```
+
+---
+
+### `GET /metrics/tasks/latest`
+
+Latest task metrics merged by `(dag_id, task_id)` from Prometheus.
+
+```bash
+curl "http://localhost:8090/metrics/tasks/latest?dag_id=practical_orders_etl"
+```
+
+---
+
+### `GET /metrics/tasks/latest-with-airflow`
+
+Latest DAG run + task instance metadata from Airflow merged with Prometheus task metrics.
+
+```bash
+curl "http://localhost:8090/metrics/tasks/latest-with-airflow?dag_id=practical_orders_etl"
+```
+
+---
+
+### `GET /metrics/tasks/range`
+
+Range query endpoint for task metric charting (Prometheus-backed).
+
+```bash
+curl "http://localhost:8090/metrics/tasks/range?dag_id=practical_orders_etl&metric_name=pipeline_task_duration_seconds&window=1h&step=30s"
+```
+
+---
+
 ## Streamlit UI
 
-Access at **http://localhost:8501**
+Access at **http://localhost:8502**
 
 ### Run Pipeline page
 
 A four-step workflow on a single page:
 
 **Step 01 — Upload package**
-Drop a `.zip` file and click Upload. The installed file list (DAGs, scripts, data) is shown immediately after.
+Two modes:
+
+- **Zip package**: upload a prebuilt `.zip`
+- **Build from files**: upload individual DAG/scripts/data files and optionally a `pipeline.yaml/json`
+
+If no manifest is provided and no DAG file is uploaded, Streamlit can auto-generate a simple linear `pipeline.json` from the uploaded scripts.
 
 **Step 02 — Select DAG and trigger run**
 The DAG dropdown auto-populates from the Execution API after a successful upload. Click **Run Pipeline** to trigger.
@@ -607,15 +721,18 @@ On success, `output.csv` is fetched automatically. A row-count slider lets you p
 
 ### Metrics page
 
-Four tabs, auto-refreshing every 15 seconds:
+The Metrics page now uses Execution API metrics endpoints (not raw PromQL-only UI logic) and auto-refreshes every 15 seconds.
 
-**Pipeline Tasks** — one card per `(dag_id, task_id)` pair showing last duration and exit code with colour-coded status.
+Tabs:
 
-**Carbon Emissions** — total emissions in kg CO₂e with driving-distance and energy equivalences, plus a per-task breakdown table.
+- **Latest Run**: latest Airflow DAG run + task states + task metrics (`/metrics/tasks/latest-with-airflow`)
+- **Task Trends**: chartable time-series (`/metrics/tasks/range`)
+- **Platform**: curated cAdvisor and Airflow/StatsD summaries (reduced dump noise)
 
-**Containers** — cAdvisor data showing CPU% and memory (MB) for every running container.
+Notes:
 
-**Airflow** — raw StatsD metric dump from the statsd-exporter.
+- cAdvisor may show little or no data for task containers after a run because task containers are short-lived and `auto_remove=True`.
+- Task-level post-run analysis should rely on `pipeline_task_*` metrics (duration/exit/emissions) exposed via the Execution API.
 
 ---
 
@@ -627,12 +744,14 @@ make down            Stop all services (volumes preserved)
 make destroy         Stop all services AND delete all volumes
 make restart         Full restart (down + up)
 make health          Run health check against running stack
-make health-wait     Poll until all services healthy (max 3 min)
+make health-wait     Poll until all services healthy (default max 6 min)
 
 make build-runner    Build the pipeline-task-runner image
 make verify-runner   Check runner image contains latest textfile metrics code
 
 make upload          Zip and upload packages/sample_package
+make upload-generated          Zip and upload packages/sample_generated_package (declarative)
+make upload-practical-generated Zip and upload packages/practical_generated_package (3-task declarative demo)
 make trigger         Manually trigger sample_runner_dag via Airflow CLI
 make check-dag       Verify DAG is registered and has no import errors
 
@@ -675,11 +794,18 @@ docker compose up -d --build streamlit
 
 ### Adding a new pipeline package
 
-1. Create a directory under `packages/` with the `dags/`, `scripts/`, `data/` structure
-2. Write your DAG using `DockerOperator` (see [The Package Format](#the-package-format))
-3. Write your transform script (reads `INPUT_FILE`, writes `OUTPUT_FILE`)
-4. Run `make upload` (or adjust the `upload` target in the Makefile for your package name)
-5. Trigger from Streamlit or `make trigger`
+Choose one approach:
+
+1. **Declarative (recommended)**:
+   - create `pipeline.yaml` or `pipeline.json`
+   - add `scripts/` and optional `data/`
+   - upload via Streamlit or `make upload-generated` / `make upload-practical-generated`
+2. **Legacy DAG package**:
+   - create `dags/`, `scripts/`, `data/`
+   - write a `DockerOperator` DAG
+   - upload via `make upload`
+
+For simple use cases, the Streamlit UI can build a package from individual files and auto-generate `pipeline.json`.
 
 ### Running the health check standalone
 
@@ -706,7 +832,7 @@ make logs SERVICE=airflow-scheduler
 
 ### `make up` times out waiting for Airflow Webserver
 
-Airflow's first-time DB migration can take 60–90 seconds. If the 3-minute timeout is hit:
+Airflow's first-time DB migration and provider loading can take several minutes. The health check wait timeout is now 6 minutes by default. If startup still times out:
 
 ```bash
 # Check what airflow-init is doing
@@ -829,4 +955,4 @@ make upload     # re-seed the sample package
 | Grafana | http://localhost:3000 | `admin` | `admin` |
 | Execution API docs | http://localhost:8090/docs | — | — |
 | Prometheus | http://localhost:9090 | — | — |
-| Streamlit | http://localhost:8501 | — | — |
+| Streamlit | http://localhost:8502 | — | — |

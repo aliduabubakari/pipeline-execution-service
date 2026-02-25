@@ -1,0 +1,13 @@
+dag_id: sample_generated_runner
+tags:
+  - demo
+  - generated
+tasks:
+  - id: run_transform
+    script: transform.py
+    env:
+      INPUT_FILE: /app/data/input.csv
+      OUTPUT_FILE: /app/data/output_generated.csv
+    metrics:
+      enabled: true
+      carbon: true

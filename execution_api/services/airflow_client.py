@@ -53,6 +53,31 @@ class AirflowClient:
         r.raise_for_status()
         return r.json()
 
+    def list_dag_runs(
+        self,
+        dag_id: str,
+        *,
+        limit: int = 1,
+        order_by: str = "-start_date",
+    ) -> list[dict]:
+        r = requests.get(
+            f"{self.base_url}/api/v1/dags/{dag_id}/dagRuns",
+            auth=self.auth,
+            params={"limit": limit, "order_by": order_by},
+            timeout=self.timeout_s,
+        )
+        r.raise_for_status()
+        return r.json().get("dag_runs", [])
+
+    def list_task_instances(self, dag_id: str, run_id: str) -> list[dict]:
+        r = requests.get(
+            f"{self.base_url}/api/v1/dags/{dag_id}/dagRuns/{run_id}/taskInstances",
+            auth=self.auth,
+            timeout=self.timeout_s,
+        )
+        r.raise_for_status()
+        return r.json().get("task_instances", [])
+
     def wait_for_dag(
         self,
         dag_id: str,

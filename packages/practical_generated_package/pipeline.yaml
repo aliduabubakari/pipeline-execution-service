@@ -1,0 +1,35 @@
+dag_id: practical_orders_etl
+tags:
+  - demo
+  - generated
+  - etl
+tasks:
+  - id: clean_orders
+    script: clean_orders.py
+    env:
+      INPUT_FILE: /app/data/orders_raw.csv
+      OUTPUT_FILE: /app/data/orders_clean.csv
+    metrics:
+      enabled: true
+      carbon: true
+
+  - id: enrich_orders
+    script: enrich_orders.py
+    depends_on: [clean_orders]
+    env:
+      ORDERS_FILE: /app/data/orders_clean.csv
+      PRODUCTS_FILE: /app/data/products.csv
+      OUTPUT_FILE: /app/data/orders_enriched.csv
+    metrics:
+      enabled: true
+      carbon: true
+
+  - id: summarize_daily_sales
+    script: summarize_daily_sales.py
+    depends_on: [enrich_orders]
+    env:
+      INPUT_FILE: /app/data/orders_enriched.csv
+      OUTPUT_FILE: /app/data/daily_sales_summary.csv
+    metrics:
+      enabled: true
+      carbon: true

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, File, HTTPException, UploadFile, Query
 from fastapi.responses import HTMLResponse, FileResponse
 from requests.exceptions import HTTPError, RequestException
@@ -11,9 +12,18 @@ from execution_api.schemas import (
     TriggerRequest,
     TriggerResponse,
     RunStatusResponse,
+    TaskMetricsLatest,
+    TaskMetricsLatestResponse,
+    TaskMetricsLatestWithAirflow,
+    TaskMetricsLatestWithAirflowResponse,
+    MetricsCapabilitiesResponse,
+    TaskMetricRangePoint,
+    TaskMetricRangeSeries,
+    TaskMetricsRangeResponse,
 )
 from execution_api.services.package_manager import PackageManager
 from execution_api.services.airflow_client import AirflowClient
+from execution_api.services.prometheus_client import PrometheusClient
 from execution_api.utils.fs import PackageError
 
 app = FastAPI(title="Pipeline Execution API", version="0.1.0")
@@ -27,9 +37,11 @@ DATA_DIR     = os.environ.get("DATA_DIR",         "/mnt/data")
 AIRFLOW_URL  = os.environ.get("AIRFLOW_URL",      "http://airflow-webserver:8080")
 AIRFLOW_USER = os.environ.get("AIRFLOW_USER",     "airflow")
 AIRFLOW_PASS = os.environ.get("AIRFLOW_PASSWORD", "airflow")
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
 
 pkg_mgr = PackageManager(dags_dir=DAGS_DIR, scripts_dir=SCRIPTS_DIR, data_dir=DATA_DIR)
 airflow = AirflowClient(base_url=AIRFLOW_URL, username=AIRFLOW_USER, password=AIRFLOW_PASS)
+prometheus = PrometheusClient(base_url=PROMETHEUS_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +56,10 @@ async def upload_package(
         raise HTTPException(status_code=400, detail="Only .zip uploads are supported")
 
     try:
+        try:
+            before = {d["dag_id"] for d in airflow.list_dags()}
+        except Exception:
+            before = set()
         content = await file.read()
         result = pkg_mgr.install_zip(content, replace=replace)
     except PackageError as e:
@@ -59,12 +75,6 @@ async def upload_package(
     discovered: list[str] = []
 
     if dag_files:
-        # Snapshot DAGs known BEFORE this upload so we can detect new ones
-        try:
-            before = {d["dag_id"] for d in airflow.list_dags()}
-        except Exception:
-            before = set()
-
         # Poll for up to 60 s (Airflow rescans every 15 s by default)
         import time
         deadline = time.time() + 60
@@ -158,6 +168,303 @@ async def list_pipelines():
         raise HTTPException(status_code=502, detail=f"Airflow error: {e}")
     except RequestException as e:
         raise HTTPException(status_code=503, detail=f"Airflow unavailable: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Task Metrics (Prometheus)
+# ---------------------------------------------------------------------------
+@app.get("/metrics/tasks/latest", response_model=TaskMetricsLatestResponse)
+async def get_task_metrics_latest(dag_id: str | None = Query(None)):
+    tasks = [TaskMetricsLatest(**row) for row in _fetch_latest_task_metric_rows(dag_id=dag_id)]
+    return TaskMetricsLatestResponse(tasks=tasks)
+
+
+@app.get("/metrics/tasks/latest-with-airflow", response_model=TaskMetricsLatestWithAirflowResponse)
+async def get_task_metrics_latest_with_airflow(dag_id: str = Query(...)):
+    metric_rows = _fetch_latest_task_metric_rows(dag_id=dag_id)
+
+    try:
+        dag_runs = airflow.list_dag_runs(dag_id, limit=1, order_by="-start_date")
+    except HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"DAG '{dag_id}' not found in Airflow")
+        raise HTTPException(status_code=502, detail=f"Airflow error: {e}")
+    except RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Airflow unavailable: {e}")
+
+    latest_run = dag_runs[0] if dag_runs else None
+    run_id = latest_run.get("dag_run_id") if latest_run else None
+    dag_run_state = latest_run.get("state") if latest_run else None
+
+    task_instances_by_id: dict[str, dict] = {}
+    if latest_run and run_id:
+        try:
+            task_instances = airflow.list_task_instances(dag_id, run_id)
+            task_instances_by_id = {str(ti.get("task_id")): ti for ti in task_instances if ti.get("task_id")}
+        except HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Airflow error while listing task instances: {e}")
+        except RequestException as e:
+            raise HTTPException(status_code=503, detail=f"Airflow unavailable: {e}")
+
+    merged_rows: list[TaskMetricsLatestWithAirflow] = []
+    seen_task_ids: set[str] = set()
+
+    for row in metric_rows:
+        task_id = row["task_id"]
+        seen_task_ids.add(task_id)
+        ti = task_instances_by_id.get(task_id, {})
+        merged_rows.append(
+            TaskMetricsLatestWithAirflow(
+                **row,
+                run_id=run_id,
+                dag_run_state=dag_run_state,
+                airflow_state=ti.get("state"),
+                start_date=ti.get("start_date"),
+                end_date=ti.get("end_date"),
+                try_number=_coerce_int(ti.get("try_number")),
+            )
+        )
+
+    # Include tasks from the latest Airflow run even if Prometheus has not scraped metrics yet.
+    for task_id, ti in sorted(task_instances_by_id.items(), key=lambda item: item[0]):
+        if task_id in seen_task_ids:
+            continue
+        merged_rows.append(
+            TaskMetricsLatestWithAirflow(
+                dag_id=dag_id,
+                task_id=task_id,
+                key=f"{dag_id}/{task_id}",
+                run_id=run_id,
+                dag_run_state=dag_run_state,
+                airflow_state=ti.get("state"),
+                start_date=ti.get("start_date"),
+                end_date=ti.get("end_date"),
+                try_number=_coerce_int(ti.get("try_number")),
+            )
+        )
+
+    merged_rows.sort(key=lambda t: (t.dag_id, t.task_id))
+    return TaskMetricsLatestWithAirflowResponse(
+        dag_id=dag_id,
+        run_id=run_id,
+        dag_run_state=dag_run_state,
+        tasks=merged_rows,
+    )
+
+
+@app.get("/metrics/capabilities", response_model=MetricsCapabilitiesResponse)
+async def get_metrics_capabilities():
+    prometheus_reachable = False
+    airflow_reachable = False
+
+    try:
+        # lightweight query to verify Prometheus reachability
+        prometheus.query("up")
+        prometheus_reachable = True
+    except Exception:
+        prometheus_reachable = False
+
+    try:
+        airflow.list_dags()
+        airflow_reachable = True
+    except Exception:
+        airflow_reachable = False
+
+    return MetricsCapabilitiesResponse(
+        providers={
+            "prometheus": {"url": PROMETHEUS_URL, "reachable": prometheus_reachable},
+            "airflow": {"url": AIRFLOW_URL, "reachable": airflow_reachable},
+        },
+        endpoints={
+            "tasks_latest": "/metrics/tasks/latest",
+            "tasks_latest_with_airflow": "/metrics/tasks/latest-with-airflow",
+            "tasks_range": "/metrics/tasks/range",
+        },
+        task_metrics=[
+            "pipeline_task_duration_seconds",
+            "pipeline_task_exit_code",
+            "pipeline_task_emissions_kg_co2",
+        ],
+        task_range_defaults={"window": "1h", "step": "30s"},
+    )
+
+
+@app.get("/metrics/tasks/range", response_model=TaskMetricsRangeResponse)
+async def get_task_metrics_range(
+    dag_id: str | None = Query(None),
+    task_id: str | None = Query(None),
+    metric_name: str | None = Query(
+        None,
+        pattern=r"^pipeline_task_(duration_seconds|exit_code|emissions_kg_co2)$",
+    ),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
+    step: str = Query("30s"),
+    window: str = Query("1h"),
+):
+    end_value = end or datetime.now(timezone.utc).isoformat()
+    start_value = start or _compute_window_start_iso(end_value, window)
+
+    metric_names = (
+        [metric_name]
+        if metric_name
+        else [
+            "pipeline_task_duration_seconds",
+            "pipeline_task_exit_code",
+            "pipeline_task_emissions_kg_co2",
+        ]
+    )
+
+    selector = _prom_label_selector(dag_id=dag_id, task_id=task_id)
+    out_series: list[TaskMetricRangeSeries] = []
+
+    try:
+        for name in metric_names:
+            promql = f"{name}{selector}" if selector else name
+            for raw in prometheus.query_range(promql, start=start_value, end=end_value, step=step):
+                metric = raw.get("metric", {})
+                d_id = metric.get("dag_id")
+                t_id = metric.get("task_id")
+                if not d_id or not t_id:
+                    continue
+
+                points: list[TaskMetricRangePoint] = []
+                for pair in raw.get("values", []):
+                    try:
+                        ts = float(pair[0])
+                        val = float(pair[1])
+                    except Exception:
+                        continue
+                    points.append(TaskMetricRangePoint(ts=ts, value=val))
+
+                out_series.append(
+                    TaskMetricRangeSeries(
+                        metric_name=name,
+                        dag_id=str(d_id),
+                        task_id=str(t_id),
+                        key=f"{d_id}/{t_id}",
+                        points=points,
+                    )
+                )
+    except HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Prometheus error: {e}")
+    except RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Prometheus unavailable: {e}")
+
+    out_series.sort(key=lambda s: (s.metric_name, s.dag_id, s.task_id))
+    return TaskMetricsRangeResponse(
+        start=start_value,
+        end=end_value,
+        step=step,
+        filters={
+            "dag_id": dag_id,
+            "task_id": task_id,
+            "metric_name": metric_name,
+        },
+        series=out_series,
+    )
+
+
+def _fetch_latest_task_metric_rows(*, dag_id: str | None) -> list[dict]:
+    metric_queries = {
+        "duration_seconds": "pipeline_task_duration_seconds",
+        "exit_code": "pipeline_task_exit_code",
+        "emissions_kg_co2": "pipeline_task_emissions_kg_co2",
+    }
+
+    try:
+        results_by_field: dict[str, list[dict]] = {}
+        for field, metric_name in metric_queries.items():
+            promql = metric_name if not dag_id else f'{metric_name}{{dag_id="{dag_id}"}}'
+            results_by_field[field] = prometheus.query(promql)
+    except HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Prometheus error: {e}")
+    except RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Prometheus unavailable: {e}")
+
+    merged: dict[tuple[str, str], dict] = {}
+    for field, series_list in results_by_field.items():
+        for series in series_list:
+            metric = series.get("metric", {})
+            d_id = metric.get("dag_id")
+            t_id = metric.get("task_id")
+            if not d_id or not t_id:
+                continue
+
+            key = (str(d_id), str(t_id))
+            row = merged.setdefault(
+                key,
+                {
+                    "dag_id": key[0],
+                    "task_id": key[1],
+                    "key": f"{key[0]}/{key[1]}",
+                    "duration_seconds": None,
+                    "exit_code": None,
+                    "emissions_kg_co2": None,
+                },
+            )
+
+            try:
+                value = float(series["value"][1])
+            except Exception:
+                continue
+
+            row[field] = int(value) if field == "exit_code" else value
+
+    return [row for _, row in sorted(merged.items(), key=lambda item: (item[0][0], item[0][1]))]
+
+
+def _coerce_int(value) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _prom_label_selector(*, dag_id: str | None, task_id: str | None) -> str:
+    labels = []
+    if dag_id:
+        labels.append(f'dag_id="{dag_id}"')
+    if task_id:
+        labels.append(f'task_id="{task_id}"')
+    return "{" + ",".join(labels) + "}" if labels else ""
+
+
+def _compute_window_start_iso(end_value: str, window: str) -> str:
+    end_dt = _parse_time(end_value)
+    delta = _parse_window(window)
+    return (end_dt - delta).isoformat()
+
+
+def _parse_time(value: str) -> datetime:
+    # Accept epoch seconds or ISO-8601.
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except ValueError:
+        pass
+    except TypeError:
+        pass
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_window(value: str) -> timedelta:
+    m = re.fullmatch(r"(\d+)([smhd])", value)
+    if not m:
+        raise HTTPException(status_code=400, detail="Invalid window. Use formats like 30m, 1h, 6h, 1d.")
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "s":
+        return timedelta(seconds=n)
+    if unit == "m":
+        return timedelta(minutes=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    return timedelta(days=n)
 
 
 # ---------------------------------------------------------------------------
