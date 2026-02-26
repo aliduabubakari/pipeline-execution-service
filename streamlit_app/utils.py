@@ -81,6 +81,12 @@ class APIClient:
         r.raise_for_status()
         return r.json()
 
+    def platform_containers(self, compose_project: str | None = None) -> dict:
+        params = {"compose_project": compose_project} if compose_project else None
+        r = requests.get(f"{self.base}/platform/containers", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
     def list_pipelines(self) -> list[dict]:
         r = requests.get(f"{self.base}/pipelines", timeout=10)
         r.raise_for_status()

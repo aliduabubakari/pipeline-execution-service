@@ -146,6 +146,7 @@ services:
       - airflow_dags:/mnt/dags
       - pipeline_scripts:/mnt/scripts
       - pipeline_data:/mnt/data
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - app_network
 

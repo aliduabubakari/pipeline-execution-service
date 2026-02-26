@@ -91,3 +91,18 @@ class TaskMetricsRangeResponse(BaseModel):
     step: str
     filters: dict[str, Optional[str]]
     series: list[TaskMetricRangeSeries]
+
+
+class ContainerInventoryItem(BaseModel):
+    id: str
+    name: Optional[str] = None
+    status: Optional[str] = None
+    image: Optional[str] = None
+    compose_project: Optional[str] = None
+    compose_service: Optional[str] = None
+
+
+class ContainerInventoryResponse(BaseModel):
+    reachable: bool
+    containers: list[ContainerInventoryItem]
+    error: Optional[str] = None

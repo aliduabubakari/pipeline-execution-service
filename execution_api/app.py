@@ -20,9 +20,12 @@ from execution_api.schemas import (
     TaskMetricRangePoint,
     TaskMetricRangeSeries,
     TaskMetricsRangeResponse,
+    ContainerInventoryItem,
+    ContainerInventoryResponse,
 )
 from execution_api.services.package_manager import PackageManager
 from execution_api.services.airflow_client import AirflowClient
+from execution_api.services.docker_engine_client import DockerEngineClient
 from execution_api.services.prometheus_client import PrometheusClient
 from execution_api.utils.fs import PackageError
 
@@ -38,10 +41,12 @@ AIRFLOW_URL  = os.environ.get("AIRFLOW_URL",      "http://airflow-webserver:8080
 AIRFLOW_USER = os.environ.get("AIRFLOW_USER",     "airflow")
 AIRFLOW_PASS = os.environ.get("AIRFLOW_PASSWORD", "airflow")
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://prometheus:9090")
+DOCKER_API_BASE_URL = os.environ.get("DOCKER_API_BASE_URL")
 
 pkg_mgr = PackageManager(dags_dir=DAGS_DIR, scripts_dir=SCRIPTS_DIR, data_dir=DATA_DIR)
 airflow = AirflowClient(base_url=AIRFLOW_URL, username=AIRFLOW_USER, password=AIRFLOW_PASS)
 prometheus = PrometheusClient(base_url=PROMETHEUS_URL)
+docker_engine = DockerEngineClient(base_url=DOCKER_API_BASE_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +261,7 @@ async def get_task_metrics_latest_with_airflow(dag_id: str = Query(...)):
 async def get_metrics_capabilities():
     prometheus_reachable = False
     airflow_reachable = False
+    docker_reachable = False
 
     try:
         # lightweight query to verify Prometheus reachability
@@ -270,10 +276,17 @@ async def get_metrics_capabilities():
     except Exception:
         airflow_reachable = False
 
+    try:
+        docker_engine.list_containers()
+        docker_reachable = True
+    except Exception:
+        docker_reachable = False
+
     return MetricsCapabilitiesResponse(
         providers={
             "prometheus": {"url": PROMETHEUS_URL, "reachable": prometheus_reachable},
             "airflow": {"url": AIRFLOW_URL, "reachable": airflow_reachable},
+            "docker_engine": {"url": DOCKER_API_BASE_URL or "from_env", "reachable": docker_reachable},
         },
         endpoints={
             "tasks_latest": "/metrics/tasks/latest",
@@ -287,6 +300,31 @@ async def get_metrics_capabilities():
         ],
         task_range_defaults={"window": "1h", "step": "30s"},
     )
+
+
+@app.get("/platform/containers", response_model=ContainerInventoryResponse)
+async def get_platform_containers(compose_project: str | None = Query(None)):
+    try:
+        rows = docker_engine.list_containers()
+    except Exception as e:
+        return ContainerInventoryResponse(reachable=False, containers=[], error=str(e))
+
+    if compose_project:
+        rows = [r for r in rows if r.get("compose_project") == compose_project]
+
+    containers = [
+        ContainerInventoryItem(
+            id=r["id"],
+            name=r.get("name"),
+            status=r.get("status"),
+            image=r.get("image"),
+            compose_project=r.get("compose_project"),
+            compose_service=r.get("compose_service"),
+        )
+        for r in rows
+    ]
+    containers.sort(key=lambda c: ((c.compose_project or ""), (c.compose_service or ""), (c.name or c.id)))
+    return ContainerInventoryResponse(reachable=True, containers=containers)
 
 
 @app.get("/metrics/tasks/range", response_model=TaskMetricsRangeResponse)

@@ -79,6 +79,30 @@ def fmt_num(value, digits: int = 3) -> str:
     return f"{v:.6g}"
 
 
+def _container_display_name(metric: dict) -> str:
+    for key in (
+        "container_label_com_docker_compose_service",
+        "container",
+        "name",
+        "container_name",
+    ):
+        value = metric.get(key)
+        if value and value not in {"POD", "/"}:
+            return str(value)
+    # Last resort: shorten container id if present.
+    cid = metric.get("id")
+    if isinstance(cid, str) and cid.startswith("/docker/"):
+        return cid.split("/")[-1][:12]
+    return "unknown"
+
+
+def _docker_id_from_cadvisor_metric(metric: dict) -> str | None:
+    cid = metric.get("id")
+    if isinstance(cid, str) and cid.startswith("/docker/"):
+        return cid.split("/")[-1]
+    return None
+
+
 if "metrics_last_refresh" not in st.session_state:
     st.session_state.metrics_last_refresh = time.time()
 
@@ -105,6 +129,7 @@ with st.sidebar:
     window = st.selectbox("Window", ["15m", "1h", "6h", "24h"], index=1)
     step = st.selectbox("Step", ["15s", "30s", "60s"], index=1)
     auto_refresh = st.checkbox("Auto-refresh every 15s", value=True)
+    compose_project_filter = st.text_input("Compose project (optional)", value="pipeline-execution-service")
 
 # Capabilities
 capabilities = None
@@ -241,28 +266,86 @@ with tab_platform:
     p1, p2 = st.columns(2)
     with p1:
         st.markdown("#### cAdvisor (containers)")
-        cpu_results = prom.query('rate(container_cpu_usage_seconds_total{name!=""}[1m])')
-        mem_results = prom.query('container_memory_working_set_bytes{name!=""}')
+        # cAdvisor label sets vary by version/runtime; do not rely on `name` existing.
+        cpu_results = prom.query('rate(container_cpu_usage_seconds_total{id!="/"}[1m])')
+        mem_results = prom.query('container_memory_working_set_bytes{id!="/"}')
         if not cpu_results and not mem_results:
             no_data_card(
                 "No container data returned. cAdvisor may be up but task containers are short-lived (`auto_remove=True`). "
                 "Use task-level metrics for post-run analysis and watch this tab during active runs."
             )
         else:
-            cpu_by_name = {r["metric"].get("name", "?"): float(r["value"][1]) for r in cpu_results}
-            mem_by_name = {r["metric"].get("name", "?"): float(r["value"][1]) for r in mem_results}
-            names = sorted(n for n in set(cpu_by_name) | set(mem_by_name) if n)
+            container_map = {}
+            try:
+                inventory = api.platform_containers(compose_project=compose_project_filter or None)
+                if inventory.get("reachable"):
+                    for c in inventory.get("containers", []):
+                        cid = str(c.get("id", ""))
+                        if not cid:
+                            continue
+                        label = c.get("compose_service") or c.get("name") or cid[:12]
+                        container_map[cid] = label
+                        container_map[cid[:12]] = label
+            except Exception:
+                inventory = None
+
+            cpu_by_name = {}
+            for r in cpu_results:
+                metric = r.get("metric", {})
+                docker_id = _docker_id_from_cadvisor_metric(metric)
+                name = (
+                    container_map.get(docker_id or "", None)
+                    or container_map.get((docker_id or "")[:12], None)
+                    or _container_display_name(metric)
+                )
+                try:
+                    cpu_by_name[name] = cpu_by_name.get(name, 0.0) + float(r["value"][1]) * 100.0
+                except Exception:
+                    continue
+
+            mem_by_name = {}
+            for r in mem_results:
+                metric = r.get("metric", {})
+                docker_id = _docker_id_from_cadvisor_metric(metric)
+                name = (
+                    container_map.get(docker_id or "", None)
+                    or container_map.get((docker_id or "")[:12], None)
+                    or _container_display_name(metric)
+                )
+                try:
+                    # Keep the max memory series if duplicate labels collapse to same display name.
+                    mem_mb = float(r["value"][1]) / (1024 ** 2)
+                    mem_by_name[name] = max(mem_by_name.get(name, 0.0), mem_mb)
+                except Exception:
+                    continue
+
+            names = sorted(
+                n
+                for n in set(cpu_by_name) | set(mem_by_name)
+                if n and n not in {"unknown"} and n not in {"/docker", "/restricted"}
+            )
             rows = []
             for name in names:
                 rows.append(
                     {
                         "container": name,
-                        "cpu_pct": round(cpu_by_name.get(name, 0.0) * 100, 3),
-                        "mem_mb": round(mem_by_name.get(name, 0.0) / (1024 ** 2), 2),
+                        "cpu_pct": round(cpu_by_name.get(name, 0.0), 3),
+                        "mem_mb": round(mem_by_name.get(name, 0.0), 2),
                     }
                 )
-            df_c = pd.DataFrame(rows).sort_values("mem_mb", ascending=False)
-            st.dataframe(df_c.head(12), use_container_width=True, hide_index=True)
+            if not rows:
+                no_data_card(
+                    "cAdvisor returned series, but no displayable container labels were found. "
+                    "Check Prometheus labels for `container_memory_working_set_bytes` in Prometheus UI."
+                )
+            else:
+                df_c = pd.DataFrame(rows).sort_values("mem_mb", ascending=False)
+                st.dataframe(df_c.head(12), use_container_width=True, hide_index=True)
+                if not container_map:
+                    st.caption(
+                        "Showing cAdvisor labels/IDs only. Enable execution-api Docker socket access and `/platform/containers` "
+                        "for friendlier Docker Compose service names."
+                    )
 
     with p2:
         st.markdown("#### Airflow / StatsD (curated)")
